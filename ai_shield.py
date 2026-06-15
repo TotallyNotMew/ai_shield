@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
-
 import os, sys, time, threading, subprocess, shutil, queue, logging
 import platform, math, hashlib, json, re
 import urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 
 if platform.system() != "Windows":
     print("AI Shield currently supports Windows only.")
@@ -34,15 +33,21 @@ import pystray
 from PIL import Image, ImageDraw
 
 APP_NAME    = "AI Shield"
-APP_VERSION = "2.1"
+APP_VERSION = "2.2"
 
-UPDATE_SCRIPT_URL  = "" 
-UPDATE_VERSION_URL = ""
+UPDATE_SCRIPT_URL  = "https://raw.githubusercontent.com/TotallyNotMew/ai_shield/main/ai_shield.py"
+UPDATE_VERSION_URL = "https://raw.githubusercontent.com/TotallyNotMew/ai_shield/main/version.txt"
 
 ANTHROPIC_API_KEY = ""
 
-AUTO_DELETE_CRITICAL  = True
+AUTO_DELETE_CRITICAL  = False
 CHECK_UPDATE_ON_START = True
+
+FILE_SETTLE_DELAY = 3.0
+
+MAX_SCAN_WORKERS = 3
+
+MAX_WATCHER_FILE_SIZE = 20 * 1024 * 1024
 
 DATA_DIR   = Path.home() / "AppData" / "Local" / "AIShield"
 LOG_FILE   = DATA_DIR / "shield.log"
@@ -73,9 +78,7 @@ DEEP_SCAN_EXTRAS: list[Path] = [
     Path(r"C:\ProgramData"),
 ]
 
-
 TRUSTED_PATH_FRAGMENTS: list[str] = [
-
     r"\windows\system32",
     r"\windows\syswow64",
     r"\windows\winsxs",
@@ -105,6 +108,8 @@ TRUSTED_PATH_FRAGMENTS: list[str] = [
     r"\minecraft",
     r"\mojang",
     r"\fortnite",
+    r"\epic games\fortnite",
+    r"\heroic",
 
     r"\google",
     r"\chrome",
@@ -139,7 +144,7 @@ TRUSTED_PATH_FRAGMENTS: list[str] = [
 
 TRUSTED_FILENAMES: set[str] = {
     "robloxplayerlauncher.exe", "robloxplayerbeta.exe",
-    "robloxstudiolauncher.exe",  "robloxstudio.exe",
+    "robloxstudiolauncher.exe", "robloxstudio.exe",
 
     "msiexec.exe", "wusa.exe", "wuauclt.exe",
     "dxsetup.exe", "vcredist_x64.exe", "vcredist_x86.exe",
@@ -148,37 +153,60 @@ TRUSTED_FILENAMES: set[str] = {
     "ndp48-x86-x64-allos-enu.exe",
 
     "uninst.exe", "uninstall.exe",
-    "setup.exe",  "install.exe",
+    "setup.exe", "install.exe",
     "update.exe", "updater.exe",
-    "launcher.exe",
+    "launcher.exe", "patcher.exe",
+    "helper.exe",
 
     "easyanticheat.exe", "eac_setup.exe",
     "battleye.exe", "beeservice.exe",
     "faceit.exe", "vgc.exe", "vgtray.exe",
+
+    "directx_jun2010_redist.exe",
+    "oalinst.exe",
+    "dotnetfx35.exe",
+    "windowsxp-kb942288-v3-x86.exe",
 }
+
+TRUSTED_FILENAME_PREFIXES: tuple[str, ...] = (
+    "setup_",
+    "install_",
+    "update_",
+    "patch_",
+    "redist",
+    "vcredist",
+    "directx",
+    "dotnet",
+    "npp.",
+    "vlc-",
+    "firefox setup",
+    "chrome setup",
+    "7z",
+    "winrar",
+)
 
 DANGEROUS_EXTENSIONS: dict[str, str] = {
     ".exe": "Executable — runs code directly on your system",
     ".bat": "Batch script — can silently run system commands",
     ".cmd": "Command script — can silently run system commands",
-    ".vbs": "Visual Basic Script — very common in malware droppers",
-    ".ps1": "PowerShell script — can modify system settings and files",
-    ".scr": "Screen-saver format — routinely used to disguise malware",
+    ".vbs": "Visual Basic Script — common in malware droppers",
+    ".ps1": "PowerShell script — can modify system settings",
+    ".scr": "Screen-saver format — often used to disguise malware",
     ".pif": "Legacy program-info file — treated as executable by Windows",
-    ".com": "Old-style command / executable format",
-    ".jar": "Java archive — can execute arbitrary code via the JVM",
+    ".com": "Old-style command format",
+    ".jar": "Java archive — can execute arbitrary code via JVM",
     ".msi": "Windows installer — installs software system-wide",
     ".hta": "HTML Application — runs with full system privileges",
-    ".wsf": "Windows Script File — can chain and run multiple scripts",
+    ".wsf": "Windows Script File — can chain multiple scripts",
     ".reg": "Registry file — directly modifies the Windows Registry",
     ".cpl": "Control Panel extension — executed by Windows Explorer",
     ".lnk": "Windows shortcut — can silently run malicious programs",
-    ".js":  "JavaScript file — executes with full system access via WScript",
-    ".jse": "Encoded JScript — obfuscated JavaScript, frequently malicious",
-    ".vbe": "Encoded VBScript — obfuscated VBS, frequently malicious",
-    ".wsh": "Windows Script Host settings file — can execute scripts",
-    ".xll": "Excel add-in DLL — executes code inside Microsoft Excel",
-    ".cab": "Cabinet archive — historically used to deliver exploits",
+    ".js":  "JavaScript file — can execute with system access via WScript",
+    ".jse": "Encoded JScript — obfuscated JavaScript",
+    ".vbe": "Encoded VBScript — obfuscated VBS",
+    ".wsh": "Windows Script Host settings file",
+    ".xll": "Excel add-in DLL — executes code inside Excel",
+    ".cab": "Cabinet archive — used to deliver exploits historically",
     ".iso": "Disk image — can auto-run executables when mounted",
 }
 
@@ -189,21 +217,20 @@ _HIGH_RISK_EXTS = {
 
 _LOW_CONTEXT_EXTS = {".lnk", ".msi", ".cab", ".iso", ".reg", ".jar"}
 
-# Keywords — matched as whole words / tokens to avoid "firecracker" → "crack"
 SUSPICIOUS_WORDS: list[str] = [
-    "keygen", "hack", "cracker", "loader", "activator",
-    "cheat", "bypass", "exploit", "inject", "payload", "trojan",
+    "keygen", "hack", "cracker", "exploit", "payload", "trojan",
     "ransomware", "backdoor", "rootkit", "stealer", "miner",
     "worm", "botnet", "ratware", "logger", "spyware", "malware", "virus",
-    "dropper", "downloader", "grabber", "dumper", "crypter",
+    "dropper", "dumper", "crypter",
     "packer", "binder", "clipper", "hvnc",
     "no_survey", "free_robux", "free_vbucks", "generator_v",
     "password_crack", "serial_crack",
 ]
 
-# Secondary weaker keywords — only count if combined with other signals
 _WEAK_SUSPICIOUS_WORDS: list[str] = [
     "crack", "patch", "serial", "license_bypass",
+    "loader", "activator", "inject", "bypass", "cheat",
+    "downloader", "grabber",
 ]
 
 MAGIC_BYTES: list[tuple[bytes, str]] = [
@@ -279,10 +306,6 @@ RISK_COLORS: dict[str, str] = {
     "CRITICAL": "#7b0000",
 }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  LOGGING
-# ══════════════════════════════════════════════════════════════════════════════
 logging.basicConfig(
     filename=str(LOG_FILE),
     level=logging.INFO,
@@ -291,10 +314,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("AIShield")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  WINDOWS STARTUP (REGISTRY)
-# ══════════════════════════════════════════════════════════════════════════════
 _REG_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 
 def _startup_cmd() -> str:
@@ -334,10 +353,6 @@ def is_in_startup() -> bool:
     except Exception:
         return False
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  AUTO-UPDATE
-# ══════════════════════════════════════════════════════════════════════════════
 def _fetch_text(url: str, timeout: int = 10) -> str:
     try:
         req = urllib.request.Request(
@@ -384,46 +399,66 @@ def perform_update(remote_version: str) -> bool:
             shutil.copy2(backup, script_path)
         return False
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  TRUSTED-PATH HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
 def _is_trusted_path(fp: str) -> bool:
-    """
-    Return True if the file lives under a trusted directory.
-    Trusted files are skipped entirely — no alerts generated.
-    """
     fp_lo = fp.lower().replace("/", "\\")
     return any(frag in fp_lo for frag in TRUSTED_PATH_FRAGMENTS)
 
 def _is_trusted_filename(name: str) -> bool:
-    return name.lower() in TRUSTED_FILENAMES
+    name_lo = name.lower()
+    if name_lo in TRUSTED_FILENAMES:
+        return True
+    if name_lo.endswith(".exe") and name_lo.startswith(TRUSTED_FILENAME_PREFIXES):
+        return True
+    return False
 
-def _trusted_path_score_reduction(fp: str) -> int:
-    """
-    Return a score reduction (positive int) for semi-trusted locations.
-    Used for paths that are *probably* fine but aren't on the full trust list —
-    for example, any subfolder of AppData that belongs to a known company.
-    """
+def _path_score_adjustment(fp: str) -> int:
     fp_lo = fp.lower()
-    reductions = [
+    total = 0
+
+    downloads_path = str(_h / "downloads").lower()
+    if fp_lo.startswith(downloads_path):
+        total -= 6
+
+    semi_trusted = [
         (r"\appdata\local\temp\roblox",    20),
         (r"\appdata\local\roblox",         20),
         (r"\appdata\roaming\roblox",       20),
         (r"\appdata\local\steam",          15),
         (r"\appdata\roaming\discord",      15),
         (r"\appdata\local\discord",        15),
+        (r"\appdata\local\microsoft",      10),
+        (r"\appdata\roaming\microsoft",    10),
+        (r"\appdata\local\nvidia",         10),
     ]
-    total = 0
-    for fragment, reduction in reductions:
+    for fragment, reduction in semi_trusted:
         if fragment in fp_lo:
-            total += reduction
+            total -= reduction
+
     return total
 
+_scan_cache: dict[tuple[str, float], tuple[bool, list[str], str]] = {}
+_scan_cache_lock = threading.Lock()
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  FILE CONTENT ANALYSIS HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
+def _cache_lookup(fp: str) -> tuple[bool, list[str], str] | None:
+    try:
+        mtime = Path(fp).stat().st_mtime
+    except OSError:
+        return None
+    with _scan_cache_lock:
+        return _scan_cache.get((fp, mtime))
+
+def _cache_store(fp: str, result: tuple[bool, list[str], str]):
+    try:
+        mtime = Path(fp).stat().st_mtime
+    except OSError:
+        return
+    with _scan_cache_lock:
+        if len(_scan_cache) > 2000:
+            keys = list(_scan_cache.keys())
+            for k in keys[:1000]:
+                del _scan_cache[k]
+        _scan_cache[(fp, mtime)] = result
+
 def _read_header(fp: str, n: int = 512) -> bytes:
     try:
         with open(fp, "rb") as f:
@@ -433,7 +468,7 @@ def _read_header(fp: str, n: int = 512) -> bytes:
 
 def detect_magic(header: bytes) -> str:
     for magic, desc in MAGIC_BYTES:
-        if header[: len(magic)] == magic:
+        if header[:len(magic)] == magic:
             return desc
     return ""
 
@@ -441,28 +476,24 @@ def check_magic_mismatch(fp: str, header: bytes) -> tuple[bool, str]:
     ext = Path(fp).suffix.lower()
     if ext not in _EXT_TO_MAGIC:
         return False, ""
-    expected_list = _EXT_TO_MAGIC[ext]
-    for em in expected_list:
-        if header[: len(em)] == em:
+    for em in _EXT_TO_MAGIC[ext]:
+        if header[:len(em)] == em:
             return False, ""
-
     if header[:2] == b"\x4d\x5a":
         return True, (
             f"Magic-byte spoofing detected\n"
-            f"      Extension is {ext.upper()} but the file contains a Windows PE "
-            f"executable.\n"
-            f"      This is the most common way malware hides itself."
+            f"      Extension is {ext.upper()} but the file is a Windows PE "
+            f"executable — the most common way malware disguises itself."
         )
     actual = detect_magic(header)
     if actual:
         return True, (
             f"Extension / content mismatch\n"
-            f"      Extension: {ext.upper()}   Actual content: {actual}\n"
-            f"      The file is pretending to be something it is not."
+            f"      Extension: {ext.upper()}   Actual content: {actual}"
         )
     return False, ""
 
-def shannon_entropy(fp: str, sample: int = 65536) -> float:
+def shannon_entropy(fp: str, sample: int = 32768) -> float:
     try:
         with open(fp, "rb") as f:
             data = f.read(sample)
@@ -479,8 +510,8 @@ def shannon_entropy(fp: str, sample: int = 65536) -> float:
 def scan_file_strings(fp: str) -> list[str]:
     ext = Path(fp).suffix.lower()
     is_binary = ext in {".exe", ".dll", ".scr", ".com"}
-    is_script = ext in {".bat", ".cmd", ".ps1", ".vbs", ".js",
-                        ".jse", ".vbe", ".hta", ".wsf"}
+    is_script  = ext in {".bat", ".cmd", ".ps1", ".vbs", ".js",
+                         ".jse", ".vbe", ".hta", ".wsf"}
     if not (is_binary or is_script):
         return []
     try:
@@ -508,10 +539,6 @@ def scan_file_strings(fp: str) -> list[str]:
     return found
 
 def _word_hits(text: str, word_list: list[str]) -> list[str]:
-    """
-    Match keywords as whole tokens separated by non-alphanumeric characters.
-    Prevents 'firecracker' matching 'crack', 'bypassed' matching 'bypass', etc.
-    """
     hits: list[str] = []
     text_lo = text.lower()
     for word in word_list:
@@ -520,16 +547,11 @@ def _word_hits(text: str, word_list: list[str]) -> list[str]:
             hits.append(word)
     return hits
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  FILE ANALYSIS ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
 def analyze_file(fp: str) -> tuple[bool, list[str], str]:
-    """
-    Examine a single file using multi-layer heuristics.
-    Returns (is_suspicious, reasons, risk_level).
-    risk_level  ∈  {'NONE', 'LOW', 'MEDIUM', 'HIGH', 'CRITICAL'}
-    """
+    cached = _cache_lookup(fp)
+    if cached is not None:
+        return cached
+
     p = Path(fp)
     if not p.exists():
         return False, [], "NONE"
@@ -539,99 +561,83 @@ def analyze_file(fp: str) -> tuple[bool, list[str], str]:
     stem_lo = p.stem.lower()
     fp_lo   = fp.lower()
 
-    # ── Fast exits for clearly safe files ────────────────────────────────
-    if _is_trusted_filename(name):
-        return False, [], "NONE"
-    if _is_trusted_path(fp):
-        return False, [], "NONE"
+    if _is_trusted_filename(name) or _is_trusted_path(fp):
+        result = (False, [], "NONE")
+        _cache_store(fp, result)
+        return result
 
     reasons: list[str] = []
-    score:   int       = 0
+    score: int = 0
 
-    # Reduction for semi-trusted (but not fully trusted) paths
-    score -= _trusted_path_score_reduction(fp)
+    score += _path_score_adjustment(fp)
 
-    # ── 1. Dangerous extension ─────────────────────────────────────────────
     if ext in DANGEROUS_EXTENSIONS:
-        # .lnk, .msi, .cab, .iso, .reg, .jar need extra evidence to matter
         if ext in _LOW_CONTEXT_EXTS:
-            score += 1   # very small base — needs other signals
+            score += 1
         else:
             reasons.append(
-                f"Dangerous file type  ({ext.upper()})\n"
+                f"Dangerous file type ({ext.upper()})\n"
                 f"      {DANGEROUS_EXTENSIONS[ext]}"
             )
-            score += 3
+            score += 2
             if ext in _HIGH_RISK_EXTS:
-                score += 2
+                score += 1
 
-    # ── 2. Double-extension spoofing  (e.g. invoice.pdf.exe) ──────────────
     parts = name.split(".")
     if len(parts) > 2:
         decoy = "." + parts[-2].lower()
-        benign = {
+        benign_exts = {
             ".pdf", ".doc", ".docx", ".xls", ".xlsx",
             ".jpg", ".jpeg", ".png", ".mp3", ".mp4",
             ".zip", ".rar", ".txt", ".csv",
         }
-        if decoy in benign and ext in DANGEROUS_EXTENSIONS:
+        if decoy in benign_exts and ext in DANGEROUS_EXTENSIONS:
             reasons.append(
                 f"Double-extension disguise\n"
-                f"      File pretends to be {decoy.upper()} "
-                f"but the real extension is {ext.upper()}.\n"
-                f"      This is a classic malware technique."
+                f"      Pretends to be {decoy.upper()} but the real extension is "
+                f"{ext.upper()} — classic malware technique."
             )
-            score += 7
+            score += 8
 
-    # ── 3. Suspicious keywords in filename (whole-word matching) ──────────
     strong_hits = _word_hits(stem_lo, SUSPICIOUS_WORDS)
     if strong_hits:
         reasons.append(
-            f"Suspicious keywords in filename:  {', '.join(strong_hits)}\n"
-            f"      Legitimate software does not normally use these terms."
+            f"Suspicious keywords in filename: {', '.join(strong_hits)}\n"
+            f"      Legitimate software doesn't normally use these terms."
         )
         score += len(strong_hits) * 2
 
-    # Weak keywords only count when combined with a dangerous extension
     if ext in _HIGH_RISK_EXTS:
         weak_hits = _word_hits(stem_lo, _WEAK_SUSPICIOUS_WORDS)
         if weak_hits:
             reasons.append(
-                f"Potentially suspicious keywords in filename:  {', '.join(weak_hits)}\n"
-                f"      Combined with a high-risk extension, this warrants attention."
+                f"Potentially suspicious keywords in filename: {', '.join(weak_hits)}\n"
+                f"      These can appear in legitimate files — treated as a minor signal."
             )
             score += len(weak_hits)
 
-    # ── 4. Read file header once (reused below) ───────────────────────────
     header = _read_header(fp)
 
-    # ── 5. Magic-byte / extension mismatch ────────────────────────────────
     mismatch, mm_reason = check_magic_mismatch(fp, header)
     if mismatch:
         reasons.append(mm_reason)
-        score += 8
+        score += 10
 
-    # ── 6. High entropy (packed / encrypted executables) ──────────────────
-    # Raised thresholds significantly — many legitimate games use UPX or custom
-    # packers and will hit 7.2 with no malicious intent.
     if ext in {".exe", ".scr", ".com"}:
         ent = shannon_entropy(fp)
-        if ent > 7.6:
+        if ent > 7.7:
             reasons.append(
-                f"Extremely high file entropy  ({ent:.2f} / 8.0)\n"
-                f"      The file appears to be heavily packed or encrypted.\n"
-                f"      Malware commonly packs itself to hide from antivirus."
+                f"Extremely high file entropy ({ent:.2f}/8.0)\n"
+                f"      File appears heavily packed or encrypted — common malware technique."
             )
             score += 4
-        elif ent > 7.3:
+        elif ent > 7.4:
             reasons.append(
-                f"Elevated file entropy  ({ent:.2f} / 8.0)\n"
-                f"      File may contain compressed or encrypted payloads."
+                f"Elevated file entropy ({ent:.2f}/8.0)\n"
+                f"      May contain compressed or encrypted content."
             )
             score += 2
-        # Below 7.3 — don't flag, many legitimate installers score here
 
-    # ── 7. Suspicious API calls / commands inside the file ────────────────
     bad_strings = scan_file_strings(fp)
     if bad_strings:
         reasons.append(
@@ -641,43 +647,36 @@ def analyze_file(fp: str) -> tuple[bool, list[str], str]:
         )
         score += min(len(bad_strings) * 2, 8)
 
-    # ── 8. Tiny executable (dropper heuristic) ────────────────────────────
-    # Raised threshold and only counts when combined with other signals
     try:
         size = p.stat().st_size
-        if ext == ".exe" and 0 < size < 30_000 and score > 3:
+        if ext == ".exe" and 0 < size < 30_000 and score > 5:
             reasons.append(
-                f"Abnormally small executable  ({size // 1024} KB)\n"
+                f"Abnormally small executable ({size // 1024} KB)\n"
                 f"      Tiny EXEs are often droppers that download real malware."
             )
             score += 2
     except OSError:
         pass
 
-    # ── 9. Executable staged in Temp folder ───────────────────────────────
-    # Only flag when there are already other suspicious signals (score > 4)
-    # to avoid flagging legitimate installers that unpack into Temp.
-    if ("\\temp\\" in fp_lo or "\\tmp\\" in fp_lo) and ext in _HIGH_RISK_EXTS and score > 4:
+    if ("\\temp\\" in fp_lo or "\\tmp\\" in fp_lo) and ext in _HIGH_RISK_EXTS and score > 6:
         reasons.append(
-            "High-risk executable found in a Temp folder\n"
+            "High-risk executable in a Temp folder\n"
             "      Malware commonly stages itself in Temp to avoid detection."
         )
         score += 2
 
-    # ── 10. Hidden file attribute ─────────────────────────────────────────
     try:
         import ctypes
         attrs = ctypes.windll.kernel32.GetFileAttributesW(str(p))
-        if attrs != -1 and (attrs & 0x2):   # FILE_ATTRIBUTE_HIDDEN
+        if attrs != -1 and (attrs & 0x2):
             reasons.append(
                 "File has the Hidden attribute set\n"
                 "      Malware hides itself to avoid user detection."
             )
-            score += 2
+            score += 3
     except Exception:
         pass
 
-    # ── 11. File in startup folder ────────────────────────────────────────
     startup_paths = [
         str(_ar / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup").lower(),
         r"c:\programdata\microsoft\windows\start menu\programs\startup",
@@ -685,32 +684,23 @@ def analyze_file(fp: str) -> tuple[bool, list[str], str]:
     if any(sp in fp_lo for sp in startup_paths) and ext in _HIGH_RISK_EXTS:
         reasons.append(
             "Executable placed in a Windows Startup folder\n"
-            "      This will run automatically every time the PC boots."
+            "      Will run automatically every time the PC boots."
         )
-        score += 4
+        score += 5
 
-    # ── Score floor: never go below 0 after reductions ───────────────────
     score = max(0, score)
 
-    # ── Risk thresholds (raised slightly to reduce false positives) ───────
-    if   score == 0:   return False, [], "NONE"
-    elif score <= 4:   risk = "LOW"
-    elif score <= 7:   risk = "MEDIUM"
-    elif score <= 11:  risk = "HIGH"
-    else:              risk = "CRITICAL"
+    if   score == 0:   result = (False, [], "NONE")
+    elif score <= 5:   result = (True, reasons, "LOW")
+    elif score <= 9:   result = (True, reasons, "MEDIUM")
+    elif score <= 14:  result = (True, reasons, "HIGH")
+    else:              result = (True, reasons, "CRITICAL")
 
-    return True, reasons, risk
+    _cache_store(fp, result)
+    return result
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SESSION WHITELIST
-# ══════════════════════════════════════════════════════════════════════════════
 _whitelist: set[str] = set()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  EXPLORER HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
 def _reveal_in_explorer(filepath: str):
     norm = os.path.normpath(filepath)
     subprocess.Popen(f'explorer /select,"{norm}"')
@@ -718,17 +708,7 @@ def _reveal_in_explorer(filepath: str):
 def _open_folder(folder: Path):
     os.startfile(str(folder))
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  THREAT ALERT WINDOW
-# ══════════════════════════════════════════════════════════════════════════════
-def show_threat_window(
-    root,
-    filepath:     str,
-    reasons:      list[str],
-    risk:         str,
-    auto_deleted: bool = False,
-):
+def show_threat_window(root, filepath, reasons, risk, auto_quarantined=False):
     import tkinter as tk
     from tkinter import messagebox, scrolledtext
 
@@ -738,7 +718,7 @@ def show_threat_window(
     win = tk.Toplevel(root)
     win.title(
         f"{APP_NAME}  —  "
-        + ("CRITICAL Threat Auto-Deleted" if auto_deleted else "Suspicious File Detected")
+        + ("Threat Quarantined" if auto_quarantined else "Suspicious File Detected")
     )
     win.configure(bg="#1a1b2e")
     win.resizable(False, False)
@@ -762,17 +742,17 @@ def show_threat_window(
              fg="white", bg=accent).pack()
 
     title_text = (
-        "CRITICAL Threat — File Auto-Deleted"
-        if auto_deleted else "Suspicious File Detected"
+        "CRITICAL Threat — File Quarantined"
+        if auto_quarantined else "Suspicious File Detected"
     )
     tk.Label(hdr, text=title_text,
              font=("Segoe UI", 14, "bold"), fg="#e8e8ff", bg="#22243a",
              anchor="w").pack(anchor="w")
 
     sub_text = (
-        "This file was automatically removed because it was rated CRITICAL."
-        if auto_deleted else
-        "Review the details below and choose an action."
+        "File moved to quarantine. You can restore it from there if it's safe."
+        if auto_quarantined else
+        "Review the details below and choose what to do."
     )
     tk.Label(hdr, text=sub_text,
              font=("Segoe UI", 9), fg="#8080a8", bg="#22243a",
@@ -794,8 +774,8 @@ def show_threat_window(
              font=("Segoe UI", 11, "bold"), fg="#e8e8ff", bg="#22243a",
              wraplength=590, justify="left").pack(anchor="w")
 
-    path_color = "#ff6060" if auto_deleted else "#6666aa"
-    path_text  = ("[DELETED]  " + filepath) if auto_deleted else filepath
+    path_color = "#ffaa44" if auto_quarantined else "#6666aa"
+    path_text  = ("[QUARANTINED]  " + filepath) if auto_quarantined else filepath
     tk.Label(card, text=path_text,
              font=("Segoe UI", 8), fg=path_color, bg="#22243a",
              wraplength=590, justify="left").pack(anchor="w", pady=(2, 0))
@@ -842,7 +822,7 @@ def show_threat_window(
         except Exception as exc:
             messagebox.showwarning(APP_NAME, f"Could not open Explorer:\n{exc}", parent=win)
 
-    if auto_deleted:
+    if auto_quarantined:
         tk.Button(
             btn_area, text="OK  (understood)",
             bg="#1a5c35", fg="white", activebackground="#154d2b",
@@ -872,11 +852,11 @@ def show_threat_window(
                   command=lambda: act("ignore"), **BS
                   ).grid(row=0, column=3, padx=(5, 0), sticky="ew")
 
-    close_action = "ok" if auto_deleted else "ignore"
+    close_action = "ok" if auto_quarantined else "ignore"
     win.protocol("WM_DELETE_WINDOW", lambda: act(close_action))
     root.wait_window(win)
 
-    if auto_deleted:
+    if auto_quarantined:
         return
 
     action = result["action"] or "ignore"
@@ -912,10 +892,6 @@ def show_threat_window(
         _whitelist.add(p.name)
         log.info(f"IGNORED / whitelisted this session: {filepath}")
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SMART SCAN  ── AI-assisted full-system sweep
-# ══════════════════════════════════════════════════════════════════════════════
 def _ai_analyze(findings: list[dict]) -> str:
     if not ANTHROPIC_API_KEY or not findings:
         return ""
@@ -925,7 +901,7 @@ def _ai_analyze(findings: list[dict]) -> str:
         "A file scanner flagged these files on a user's PC. "
         "For each one give: the likely threat type (or why it might be benign), "
         "and a recommended action (safe / quarantine / delete). "
-        "Be concise. One line per file in this format:\n"
+        "Be concise. One line per file:\n"
         "FILENAME — verdict — action\n\n"
         "Files:\n" +
         "\n".join(
@@ -937,7 +913,7 @@ def _ai_analyze(findings: list[dict]) -> str:
     )
     try:
         payload = json.dumps({
-            "model":      "claude-sonnet-4-20250514",
+            "model":      "claude-sonnet-4-6",
             "max_tokens": 1500,
             "messages":   [{"role": "user", "content": prompt}],
         }).encode("utf-8")
@@ -958,7 +934,6 @@ def _ai_analyze(findings: list[dict]) -> str:
         log.error(f"AI analysis error: {exc}")
         return f"(AI analysis unavailable: {exc})"
 
-
 def _scan_registry_startups() -> list[dict]:
     entries: list[dict] = []
     reg_paths = [
@@ -977,11 +952,9 @@ def _scan_registry_startups() -> list[dict]:
                     val_lo  = val.lower()
                     name_lo = name.lower()
                     flags: list[str] = []
-                    # Only match strong keywords in registry to cut false positives
                     kw_hits = _word_hits(name_lo + " " + val_lo, SUSPICIOUS_WORDS)
                     if kw_hits:
                         flags.append(f"suspicious keywords: {', '.join(kw_hits)}")
-                    # Only flag Temp-based registry entries (not normal installs)
                     if ("\\temp\\" in val_lo or "\\tmp\\" in val_lo) and not _is_trusted_path(val):
                         flags.append("runs from Temp folder")
                     if "powershell" in val_lo and ("-enc" in val_lo or "-hidden" in val_lo):
@@ -1003,7 +976,6 @@ def _scan_registry_startups() -> list[dict]:
         except Exception:
             pass
     return entries
-
 
 def _check_hosts_file() -> list[str]:
     hosts  = Path(r"C:\Windows\System32\drivers\etc\hosts")
@@ -1030,13 +1002,24 @@ def _check_hosts_file() -> list[str]:
             if any(kw in domain for kw in well_known_kw):
                 if not ip.startswith(("127.", "0.", "::1")):
                     issues.append(
-                        f"{domain}  is redirected to  {ip}  "
-                        f"(possible DNS hijack)"
+                        f"{domain}  redirected to  {ip}  (possible DNS hijack)"
                     )
     except Exception:
         pass
     return issues
 
+def _rglob_limited(folder: Path, max_depth: int = 5):
+    def _walk(path: Path, depth: int):
+        try:
+            for item in path.iterdir():
+                yield item
+                if item.is_dir() and depth < max_depth:
+                    yield from _walk(item, depth + 1)
+        except PermissionError:
+            pass
+        except Exception:
+            pass
+    yield from _walk(folder, 1)
 
 def launch_smart_scan(root):
     import tkinter as tk
@@ -1071,7 +1054,8 @@ def launch_smart_scan(root):
     pb = ttk.Progressbar(pb_frame, mode="indeterminate", length=680)
     pb.pack(fill="x")
     pb.start(12)
-    stats_lbl = tk.Label(pb_frame, text="Scanned: 0 files   Flagged: 0   Trusted (skipped): 0",
+    stats_lbl = tk.Label(pb_frame,
+                         text="Scanned: 0   Flagged: 0   Trusted (skipped): 0",
                          font=("Segoe UI", 8), fg="#55567a", bg="#1a1b2e")
     stats_lbl.pack(anchor="w", pady=(4, 0))
 
@@ -1110,14 +1094,32 @@ def launch_smart_scan(root):
     )
     save_btn.grid(row=0, column=1, padx=(5, 0), sticky="ew")
 
-    def _ui_append(text: str):
+    _pending_lines: list[str] = []
+    _flush_scheduled = False
+
+    def _flush_log():
+        nonlocal _flush_scheduled
+        _flush_scheduled = False
+        if not _pending_lines:
+            return
         try:
             log_txt.config(state="normal")
-            log_txt.insert("end", text + "\n")
+            log_txt.insert("end", "\n".join(_pending_lines) + "\n")
+            _pending_lines.clear()
             log_txt.see("end")
             log_txt.config(state="disabled")
         except Exception:
             pass
+
+    def _ui_append(text: str):
+        _pending_lines.append(text)
+        nonlocal _flush_scheduled
+        if not _flush_scheduled:
+            _flush_scheduled = True
+            try:
+                root.after(200, _flush_log)
+            except Exception:
+                pass
 
     def _ui_status(text: str):
         try:
@@ -1128,7 +1130,7 @@ def launch_smart_scan(root):
     def _ui_stats():
         try:
             stats_lbl.config(
-                text=f"Scanned: {scan_stats['scanned']} files   "
+                text=f"Scanned: {scan_stats['scanned']}   "
                      f"Flagged: {scan_stats['flagged']}   "
                      f"Trusted (skipped): {scan_stats['skipped_trusted']}"
             )
@@ -1137,7 +1139,7 @@ def launch_smart_scan(root):
 
     def _scan():
         all_locations = list(dict.fromkeys(MONITOR_FOLDERS + DEEP_SCAN_EXTRAS))
-        seen_paths:   set[str] = set()
+        seen_paths: set[str] = set()
 
         root.after(0, lambda: _ui_append(
             f"=== {APP_NAME} Smart Scan  —  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
@@ -1154,9 +1156,7 @@ def launch_smart_scan(root):
                 findings_all.append(e)
                 root.after(0, lambda m=msg: _ui_append(m))
         else:
-            root.after(0, lambda: _ui_append(
-                "[REGISTRY]  No suspicious startup entries found."
-            ))
+            root.after(0, lambda: _ui_append("[REGISTRY]  No suspicious startup entries found."))
 
         root.after(0, lambda: _ui_status("Checking Windows hosts file ..."))
         hosts_issues = _check_hosts_file()
@@ -1165,15 +1165,11 @@ def launch_smart_scan(root):
                 f"\n[HOSTS FILE]  {len(hosts_issues)} suspicious redirect(s):"
             ))
             for h in hosts_issues:
-                findings_all.append({
-                    "type": "hosts", "name": h, "risk": "HIGH",
-                    "ext": "hosts", "reasons": [h],
-                })
+                findings_all.append({"type": "hosts", "name": h, "risk": "HIGH",
+                                     "ext": "hosts", "reasons": [h]})
                 root.after(0, lambda m=h: _ui_append(f"  WARNING: {m}"))
         else:
-            root.after(0, lambda: _ui_append(
-                "[HOSTS FILE]  No suspicious entries found."
-            ))
+            root.after(0, lambda: _ui_append("[HOSTS FILE]  No suspicious entries found."))
 
         root.after(0, lambda: _ui_append("\n[FILES]  Scanning folders ..."))
 
@@ -1184,7 +1180,7 @@ def launch_smart_scan(root):
                 continue
             root.after(0, lambda f=str(folder): _ui_status(f"Scanning: {f}"))
             try:
-                for fp in folder.rglob("*"):
+                for fp in _rglob_limited(folder, max_depth=5):
                     if scan_cancel.is_set():
                         break
                     if fp.is_dir():
@@ -1196,21 +1192,22 @@ def launch_smart_scan(root):
                         continue
                     seen_paths.add(fp_str)
 
-                    # Count trusted files separately instead of flagging them
                     if _is_trusted_path(fp_str) or _is_trusted_filename(fp.name):
                         scan_stats["skipped_trusted"] += 1
                         scan_stats["scanned"] += 1
-                        if scan_stats["scanned"] % 100 == 0:
+                        if scan_stats["scanned"] % 200 == 0:
                             root.after(0, _ui_stats)
                         continue
 
                     scan_stats["scanned"] += 1
-                    if scan_stats["scanned"] % 50 == 0:
+                    if scan_stats["scanned"] % 100 == 0:
                         root.after(0, _ui_stats)
+
                     try:
                         suspicious, reasons, risk = analyze_file(fp_str)
                     except Exception:
                         continue
+
                     if suspicious:
                         scan_stats["flagged"] += 1
                         findings_all.append({
@@ -1224,8 +1221,7 @@ def launch_smart_scan(root):
                         label = f"  [{risk:8s}]  {fp.name}"
                         root.after(0, lambda m=label: _ui_append(m))
                         log.warning(f"SMART SCAN [{risk}]: {fp_str}")
-            except PermissionError:
-                pass
+
             except Exception as exc:
                 log.error(f"Scan error in {folder}: {exc}")
 
@@ -1243,7 +1239,7 @@ def launch_smart_scan(root):
                     root.after(0, lambda t=ai_text: _ui_append("\n" + t))
             else:
                 root.after(0, lambda: _ui_append(
-                    "\n[AI ANALYSIS]  No API key set.\n"
+                    "\n[AI ANALYSIS]  No API key configured.\n"
                     "  Add your ANTHROPIC_API_KEY to enable AI-powered verdicts."
                 ))
 
@@ -1265,6 +1261,7 @@ def launch_smart_scan(root):
         done_status = "Scan cancelled." if cancelled else "Scan complete."
 
         def _finish():
+            _flush_log()
             _ui_append(summary)
             _ui_status(done_status)
             pb.stop()
@@ -1291,65 +1288,84 @@ def launch_smart_scan(root):
 
     threading.Thread(target=_scan, daemon=True, name="SmartScan").start()
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  WATCHDOG FILE-SYSTEM HANDLER
-# ══════════════════════════════════════════════════════════════════════════════
 class ShieldHandler(FileSystemEventHandler):
     def __init__(self, alert_q: "queue.Queue[tuple]"):
-        self._q    = alert_q
-        self._seen: set[str] = set()
-        self._lock = threading.Lock()
+        self._q        = alert_q
+        self._seen:    set[str]           = set()
+        self._pending: dict[str, float]   = {}
+        self._lock     = threading.Lock()
+        self._pool     = ThreadPoolExecutor(max_workers=MAX_SCAN_WORKERS,
+                                            thread_name_prefix="Shield")
+
+    def _schedule(self, fp: str):
+        with self._lock:
+            self._pending[fp] = time.monotonic() + FILE_SETTLE_DELAY
+
+        def _wait_and_eval():
+            while True:
+                time.sleep(0.5)
+                with self._lock:
+                    target = self._pending.get(fp)
+                    if target is None:
+                        return
+                    if time.monotonic() < target:
+                        continue
+                    del self._pending[fp]
+                    break
+            self._evaluate(fp)
+
+        self._pool.submit(_wait_and_eval)
 
     def _evaluate(self, fp: str):
-        time.sleep(1.5)
         p = Path(fp)
         if not p.exists():
             return
-        # Fast-path: skip trusted files and paths before acquiring the lock
+
+        try:
+            if p.stat().st_size > MAX_WATCHER_FILE_SIZE:
+                return
+        except OSError:
+            return
+
         if _is_trusted_filename(p.name) or _is_trusted_path(fp):
             return
+
         with self._lock:
             if fp in self._seen or p.name in _whitelist:
                 return
             if str(DATA_DIR) in fp:
                 return
 
-            suspicious, reasons, risk = analyze_file(fp)
-            if not suspicious:
-                return
+        suspicious, reasons, risk = analyze_file(fp)
+        if not suspicious:
+            return
 
+        with self._lock:
             self._seen.add(fp)
-            auto_deleted = False
 
-            if AUTO_DELETE_CRITICAL and risk == "CRITICAL":
-                try:
-                    p.unlink()
-                    auto_deleted = True
-                    log.warning(f"AUTO-DELETED [CRITICAL]: {fp}")
-                except Exception as exc:
-                    log.error(f"Auto-delete failed for {fp}: {exc}")
-            else:
-                log.warning(f"FLAGGED [{risk}]: {fp}")
+        auto_quarantined = False
 
-            self._q.put((fp, reasons, risk, auto_deleted))
+        if AUTO_DELETE_CRITICAL and risk == "CRITICAL":
+            try:
+                dest = QUARANTINE / (p.name + f".{int(time.time())}.quarantined")
+                shutil.move(str(p), str(dest))
+                auto_quarantined = True
+                log.warning(f"AUTO-QUARANTINED [CRITICAL]: {fp}  ->  {dest}")
+            except Exception as exc:
+                log.error(f"Auto-quarantine failed for {fp}: {exc}")
+        else:
+            log.warning(f"FLAGGED [{risk}]: {fp}")
+
+        self._q.put((fp, reasons, risk, auto_quarantined))
 
     def on_created(self, event):
         if not event.is_directory:
-            threading.Thread(
-                target=self._evaluate, args=(event.src_path,), daemon=True
-            ).start()
+            self._schedule(event.src_path)
 
     def on_moved(self, event):
         if not event.is_directory:
-            threading.Thread(
-                target=self._evaluate, args=(event.dest_path,), daemon=True
-            ).start()
+            self._schedule(event.dest_path)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SYSTEM TRAY
-# ══════════════════════════════════════════════════════════════════════════════
 def _make_tray_image() -> Image.Image:
     size = 64
     img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -1361,9 +1377,7 @@ def _make_tray_image() -> Image.Image:
     d.line([(19, 32), (28, 43), (47, 21)], fill="white", width=5)
     return img
 
-def build_tray_icon(
-    root, stop_evt: threading.Event, observer: Observer
-) -> pystray.Icon:
+def build_tray_icon(root, stop_evt: threading.Event, observer: Observer) -> pystray.Icon:
     import tkinter as tk
     from tkinter import messagebox
 
@@ -1371,16 +1385,16 @@ def build_tray_icon(
 
     def _status(i, item):
         folders    = "\n".join(f"  {f}" for f in MONITOR_FOLDERS if f.exists())
-        auto_del   = "Enabled" if AUTO_DELETE_CRITICAL else "Disabled"
-        ai_status  = "Configured" if ANTHROPIC_API_KEY else "Not set  (optional)"
-        upd_status = "Configured" if UPDATE_VERSION_URL else "Not set  (optional)"
+        auto_del   = "Quarantine" if AUTO_DELETE_CRITICAL else "Disabled (ask me)"
+        ai_status  = "Configured" if ANTHROPIC_API_KEY else "Not set (optional)"
+        upd_status = "Configured" if UPDATE_VERSION_URL else "Not set (optional)"
         root.after(0, lambda: messagebox.showinfo(
             APP_NAME,
             f"{APP_NAME}  v{APP_VERSION}\n\n"
-            f"Status:         Running\n"
-            f"Auto-delete:    {auto_del}\n"
-            f"AI analysis:    {ai_status}\n"
-            f"Auto-update:    {upd_status}\n\n"
+            f"Status:              Running\n"
+            f"Auto-quarantine:     {auto_del}\n"
+            f"AI analysis:         {ai_status}\n"
+            f"Auto-update:         {upd_status}\n\n"
             f"Watching:\n{folders}\n\n"
             f"Log:        {LOG_FILE}\n"
             f"Quarantine: {QUARANTINE}",
@@ -1406,8 +1420,7 @@ def build_tray_icon(
                 messagebox.showinfo(
                     APP_NAME,
                     "Auto-update is not configured.\n\n"
-                    "See the UPDATE SETUP GUIDE comment at the top of the script\n"
-                    "for step-by-step instructions (takes about 5 minutes).",
+                    "Set UPDATE_VERSION_URL and UPDATE_SCRIPT_URL at the top of the script.",
                 )
                 return
             available, remote = check_for_update()
@@ -1417,14 +1430,11 @@ def build_tray_icon(
                     f"Update available!\n\n"
                     f"Current version : {APP_VERSION}\n"
                     f"New version     : {remote}\n\n"
-                    "Download and apply the update now?\n"
-                    "AI Shield will restart automatically.",
+                    "Download and apply the update now?",
                 ):
                     perform_update(remote)
             else:
-                messagebox.showinfo(
-                    APP_NAME, f"You already have the latest version  (v{APP_VERSION})."
-                )
+                messagebox.showinfo(APP_NAME, f"You're on the latest version (v{APP_VERSION}).")
         root.after(0, _do)
 
     def _toggle_startup(i, item):
@@ -1433,7 +1443,7 @@ def build_tray_icon(
             root.after(0, lambda: messagebox.showinfo(
                 APP_NAME,
                 "AI Shield removed from Windows startup.\n"
-                "It will not launch automatically on next reboot.",
+                "It won't launch automatically on next reboot.",
             ))
         else:
             add_to_startup()
@@ -1464,10 +1474,6 @@ def build_tray_icon(
     )
     return icon
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ══════════════════════════════════════════════════════════════════════════════
 def main():
     import tkinter as tk
 
@@ -1484,7 +1490,7 @@ def main():
     log.info(f"  {APP_NAME} v{APP_VERSION} starting")
     log.info(f"  Script : {os.path.abspath(sys.argv[0])}")
     log.info(f"  AUTO_DELETE_CRITICAL = {AUTO_DELETE_CRITICAL}")
-    log.info(f"  Trusted paths loaded : {len(TRUSTED_PATH_FRAGMENTS)}")
+    log.info(f"  Trusted paths        : {len(TRUSTED_PATH_FRAGMENTS)}")
     log.info(f"  Trusted filenames    : {len(TRUSTED_FILENAMES)}")
     log.info("=" * 60)
 
@@ -1494,9 +1500,7 @@ def main():
             if available:
                 log.info(f"Update available: v{remote} — applying ...")
                 perform_update(remote)
-        threading.Thread(
-            target=_do_update_check, daemon=True, name="UpdateCheck"
-        ).start()
+        threading.Thread(target=_do_update_check, daemon=True, name="UpdateCheck").start()
 
     alert_q  : queue.Queue = queue.Queue()
     stop_evt = threading.Event()
@@ -1532,14 +1536,14 @@ def main():
     def poll_alerts():
         while not alert_q.empty():
             try:
-                fp, reasons, risk, auto_deleted = alert_q.get_nowait()
-                show_threat_window(root, fp, reasons, risk, auto_deleted)
+                fp, reasons, risk, auto_quarantined = alert_q.get_nowait()
+                show_threat_window(root, fp, reasons, risk, auto_quarantined)
             except queue.Empty:
                 break
         if not stop_evt.is_set():
-            root.after(600, poll_alerts)
+            root.after(800, poll_alerts)
 
-    root.after(600, poll_alerts)
+    root.after(800, poll_alerts)
 
     try:
         root.mainloop()
@@ -1549,7 +1553,6 @@ def main():
         observer.stop()
         observer.join(timeout=5)
         log.info(f"{APP_NAME} stopped.")
-
 
 if __name__ == "__main__":
     main()
