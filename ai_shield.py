@@ -35,10 +35,10 @@ from PIL import Image, ImageDraw
 APP_NAME    = "AI Shield"
 APP_VERSION = "2.2"
 
-UPDATE_SCRIPT_URL  = "https://raw.githubusercontent.com/TotallyNotMew/ai_shield/main/ai_shield.py"
-UPDATE_VERSION_URL = "https://raw.githubusercontent.com/TotallyNotMew/ai_shield/main/version.txt"
+UPDATE_SCRIPT_URL  = ""
+UPDATE_VERSION_URL = ""
 
-ANTHROPIC_API_KEY = ""
+GEMINI_API_KEY = "key_goes_here"
 
 AUTO_DELETE_CRITICAL  = False
 CHECK_UPDATE_ON_START = True
@@ -893,7 +893,7 @@ def show_threat_window(root, filepath, reasons, risk, auto_quarantined=False):
         log.info(f"IGNORED / whitelisted this session: {filepath}")
 
 def _ai_analyze(findings: list[dict]) -> str:
-    if not ANTHROPIC_API_KEY or not findings:
+    if not GEMINI_API_KEY or not findings:
         return ""
     top = findings[:15]
     prompt = (
@@ -902,34 +902,32 @@ def _ai_analyze(findings: list[dict]) -> str:
         "For each one give: the likely threat type (or why it might be benign), "
         "and a recommended action (safe / quarantine / delete). "
         "Be concise. One line per file:\n"
-        "FILENAME — verdict — action\n\n"
+        "FILENAME - verdict - action\n\n"
         "Files:\n" +
         "\n".join(
             f"- {f['name']}  "
-            f"(risk:{f['risk']}, ext:{f.get('ext','?')}, "
+            f"(risk:{f['risk']}, ext:{f.get('ext', '?')}, "
             f"flags:{'; '.join(str(r)[:60] for r in f.get('reasons', [])[:2])})"
             for f in top
         )
     )
     try:
         payload = json.dumps({
-            "model":      "claude-sonnet-4-6",
-            "max_tokens": 1500,
-            "messages":   [{"role": "user", "content": prompt}],
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"maxOutputTokens": 1500},
         }).encode("utf-8")
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"gemini-2.0-flash:generateContent?key={GEMINI_API_KEY}"
+        )
         req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=payload,
-            headers={
-                "Content-Type":      "application/json",
-                "x-api-key":         ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-            },
+            url, data=payload,
+            headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=40) as resp:
             data = json.loads(resp.read())
-            return data["content"][0]["text"]
+            return data["candidates"][0]["content"]["parts"][0]["text"]
     except Exception as exc:
         log.error(f"AI analysis error: {exc}")
         return f"(AI analysis unavailable: {exc})"
@@ -1229,7 +1227,7 @@ def launch_smart_scan(root):
 
         file_findings = [f for f in findings_all if f.get("type") == "file"]
         if file_findings:
-            if ANTHROPIC_API_KEY:
+            if GEMINI_API_KEY:
                 root.after(0, lambda: _ui_status("Running AI analysis ..."))
                 root.after(0, lambda: _ui_append(
                     "\n[AI ANALYSIS]  Sending top findings to Claude AI ..."
@@ -1240,7 +1238,7 @@ def launch_smart_scan(root):
             else:
                 root.after(0, lambda: _ui_append(
                     "\n[AI ANALYSIS]  No API key configured.\n"
-                    "  Add your ANTHROPIC_API_KEY to enable AI-powered verdicts."
+                    "  Add your GEMINI_API_KEY to enable AI-powered verdicts."
                 ))
 
         n_reg   = len([f for f in findings_all if f.get("type") == "registry"])
@@ -1386,7 +1384,7 @@ def build_tray_icon(root, stop_evt: threading.Event, observer: Observer) -> pyst
     def _status(i, item):
         folders    = "\n".join(f"  {f}" for f in MONITOR_FOLDERS if f.exists())
         auto_del   = "Quarantine" if AUTO_DELETE_CRITICAL else "Disabled (ask me)"
-        ai_status  = "Configured" if ANTHROPIC_API_KEY else "Not set (optional)"
+        ai_status  = "Configured" if GEMINI_API_KEY else "Not set (optional)"
         upd_status = "Configured" if UPDATE_VERSION_URL else "Not set (optional)"
         root.after(0, lambda: messagebox.showinfo(
             APP_NAME,
